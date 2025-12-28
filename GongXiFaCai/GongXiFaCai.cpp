@@ -1,57 +1,204 @@
-﻿// GongXiFaCai.cpp : 此文件包含 "main" 函数。程序执行将在此处开始并结束。
-//
-
-#include <iostream>
-#include <windows.h>
+﻿#include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
-#include <tlhelp32.h>
 #include <string>
 #include <vector>
+#include <filesystem>
+#include <iostream>
+#include <comdef.h>
+#include <uiautomationclient.h>
+#include <tlhelp32.h>
 
-#pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "OleAut32.lib")
+#pragma comment(lib, "Uiautomationcore.lib")
 
-// 简单的 Win32 程序：提升权限 -> 语言选择窗口（"中文"/"English"）-> 回到桌面 -> 在桌面搜索名为 "Microsoft Edge" 的快捷方式并打开（模拟双击）
-// -> 等待 2 秒 -> 将焦点切到 Edge 地址栏 (Ctrl+L) -> 输入对应 URL -> 回车
+using namespace std;
+namespace fs = std::filesystem;
 
-static const wchar_t* URL_CN = L"https://www.bilibili.com/video/BV1ad4y1V7wb";
-static const wchar_t* URL_EN = L"https://www.bilibili.com/video/BV1AHmRBCEsq";
-
-bool IsRunAsAdmin()
+bool IsRunningElevated()
 {
-    BOOL isAdmin = FALSE;
-    PSID adminGroup = NULL;
-    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
-    if (AllocateAndInitializeSid(&ntAuthority, 2,
-        SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
-        0, 0, 0, 0, 0, 0, &adminGroup))
+    BOOL fRet = FALSE;
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
     {
-        CheckTokenMembership(NULL, adminGroup, &isAdmin);
-        FreeSid(adminGroup);
+        TOKEN_ELEVATION Elevation;
+        DWORD cbSize = sizeof(TOKEN_ELEVATION);
+        if (GetTokenInformation(hToken, TokenElevation, &Elevation, sizeof(Elevation), &cbSize))
+        {
+            fRet = Elevation.TokenIsElevated;
+        }
     }
-    return isAdmin == TRUE;
+    if (hToken)
+        CloseHandle(hToken);
+    return fRet != FALSE;
 }
 
-void RelaunchElevatedAndExit()
+void RelaunchElevated()
 {
     wchar_t path[MAX_PATH];
-    GetModuleFileNameW(NULL, path, (DWORD)std::size(path));
-    SHELLEXECUTEINFOW sei{ sizeof(sei) };
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+    SHELLEXECUTEINFOW sei = { 0 };
+    sei.cbSize = sizeof(sei);
     sei.lpVerb = L"runas";
     sei.lpFile = path;
     sei.nShow = SW_SHOWNORMAL;
     if (!ShellExecuteExW(&sei))
     {
-        // 用户取消了提升或失败，继续以当前权限运行或直接退出
     }
-    ExitProcess(0);
 }
 
-// Minimal language selection window
-struct LangSelection {
-    HWND hwnd;
-    int choice; // 0=none, 1=中文, 2=English
-};
+void SendUnicodeString(const wstring &s)
+{
+    std::vector<INPUT> inputs;
+    for (wchar_t ch : s)
+    {
+        INPUT in = { 0 };
+        in.type = INPUT_KEYBOARD;
+        in.ki.wScan = ch;
+        in.ki.dwFlags = KEYEVENTF_UNICODE;
+        inputs.push_back(in);
+        INPUT out = { 0 };
+        out.type = INPUT_KEYBOARD;
+        out.ki.wScan = ch;
+        out.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        inputs.push_back(out);
+    }
+    SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+}
+
+void SendKey(WORD vk, bool down)
+{
+    INPUT in = { 0 };
+    in.type = INPUT_KEYBOARD;
+    in.ki.wVk = vk;
+    in.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    SendInput(1, &in, sizeof(in));
+}
+
+HWND FindTopLevelWindowForProcess(DWORD pid)
+{
+    struct EnumData { DWORD pid; HWND result; } data{ pid, NULL };
+    EnumWindows([](HWND hwnd, LPARAM lParam)->BOOL {
+        EnumData* d = (EnumData*)lParam;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == d->pid)
+        {
+            if (IsWindowVisible(hwnd) && GetWindow(hwnd, GW_OWNER) == NULL)
+            {
+                d->result = hwnd;
+                return FALSE;
+            }
+        }
+        return TRUE;
+    }, (LPARAM)&data);
+    return data.result;
+}
+
+wstring GetDesktopPath()
+{
+    PWSTR path = NULL;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, NULL, &path)))
+    {
+        wstring p(path);
+        CoTaskMemFree(path);
+        return p;
+    }
+    return L"";
+}
+
+bool LaunchEdgeShortcutFound(const wstring &desktop)
+{
+    for (auto &entry : fs::directory_iterator(desktop))
+    {
+        if (!entry.is_regular_file()) continue;
+        wstring name = entry.path().filename().wstring();
+        // case-insensitive search for "Microsoft Edge"
+        wstring lower = name;
+        for (auto &c : lower) c = towlower(c);
+        if (lower.find(L"microsoft edge") != wstring::npos && entry.path().extension() == L".lnk")
+        {
+            // shell execute the .lnk will open edge
+            ShellExecuteW(NULL, L"open", entry.path().c_str(), NULL, NULL, SW_SHOWNORMAL);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ClickElement(IUIAutomationElement *elem)
+{
+    if (!elem) return false;
+    IUIAutomationInvokePattern *invoke = nullptr;
+    HRESULT hr = elem->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&invoke));
+    if (SUCCEEDED(hr) && invoke)
+    {
+        invoke->Invoke();
+        invoke->Release();
+        return true;
+    }
+    VARIANT var;
+    VariantInit(&var);
+    hr = elem->GetCurrentPropertyValue(UIA_BoundingRectanglePropertyId, &var);
+    if (SUCCEEDED(hr) && var.vt == (VT_ARRAY | VT_R8))
+    {
+        SAFEARRAY *sa = var.parray;
+        double *data = nullptr;
+        if (SUCCEEDED(SafeArrayAccessData(sa, (void**)&data)) && data)
+        {
+            double left = data[0];
+            double top = data[1];
+            double width = data[2];
+            double height = data[3];
+            SafeArrayUnaccessData(sa);
+            VariantClear(&var);
+            int x = (int)(left + width / 2);
+            int y = (int)(top + height / 2);
+            // simulate mouse click
+            SetCursorPos(x, y);
+            INPUT inputs[2] = {};
+            inputs[0].type = INPUT_MOUSE;
+            inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+            inputs[1].type = INPUT_MOUSE;
+            inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+            SendInput(2, inputs, sizeof(INPUT));
+            return true;
+        }
+    }
+    VariantClear(&var);
+    return false;
+}
+
+bool FindAndClickByName(IUIAutomation *automation, HWND hwnd, const wstring &name)
+{
+    if (!automation) return false;
+    HRESULT hr;
+    IUIAutomationElement *root = NULL;
+    hr = automation->ElementFromHandle(hwnd, &root);
+    if (FAILED(hr) || !root) return false;
+    VARIANT varName;
+    varName.vt = VT_BSTR;
+    varName.bstrVal = SysAllocStringLen(name.c_str(), (UINT)name.size());
+    IUIAutomationCondition *cond = NULL;
+    hr = automation->CreatePropertyCondition(UIA_NamePropertyId, varName, &cond);
+    VariantClear(&varName);
+    if (FAILED(hr) || !cond) { root->Release(); return false; }
+    IUIAutomationElement *found = NULL;
+    hr = root->FindFirst(TreeScope_Subtree, cond, &found);
+    cond->Release();
+    root->Release();
+    if (FAILED(hr) || !found) return false;
+    bool ok = ClickElement(found);
+    found->Release();
+    return ok;
+}
+
+struct LangSelection { int choice; };
 
 LRESULT CALLBACK LangWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -60,6 +207,12 @@ LRESULT CALLBACK LangWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
     case WM_CREATE:
         {
+            CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
+            if (cs && cs->lpCreateParams)
+            {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+                data = (LangSelection*)cs->lpCreateParams;
+            }
             CreateWindowW(L"STATIC", L"请选择语言 / Please choose language:",
                 WS_VISIBLE | WS_CHILD | SS_CENTER, 10, 10, 360, 20, hwnd, NULL, NULL, NULL);
             CreateWindowW(L"BUTTON", L"中文", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
@@ -88,234 +241,152 @@ LRESULT CALLBACK LangWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
-int ShowLanguageSelectionDialog()
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow)
 {
-    const wchar_t CLASS_NAME[] = L"LangSelectWndClass";
-    WNDCLASSEXW wc{};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = LangWndProc;
-    wc.hInstance = GetModuleHandleW(NULL);
-    wc.lpszClassName = CLASS_NAME;
-    RegisterClassExW(&wc);
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
-    LangSelection data{};
-    data.choice = 0;
-
-    HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"语言选择 / Language",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 400, 140,
-        NULL, NULL, GetModuleHandleW(NULL), NULL);
-
-    if (!hwnd) return 0;
-    // center window
-    RECT rc;
-    GetWindowRect(hwnd, &rc);
-    int w = rc.right - rc.left;
-    int h = rc.bottom - rc.top;
-    int sx = GetSystemMetrics(SM_CXSCREEN);
-    int sy = GetSystemMetrics(SM_CYSCREEN);
-    SetWindowPos(hwnd, NULL, (sx - w) / 2, (sy - h) / 2, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-
-    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)&data);
-    ShowWindow(hwnd, SW_SHOW);
-
-    MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0) > 0)
+    if (!IsRunningElevated())
     {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        RelaunchElevated();
+        return 0;
     }
 
-    return data.choice;
-}
+    bool chinese = true;
+    {
+        LangSelection* sel = new LangSelection(); sel->choice = 0;
+        WNDCLASSW wc = { 0 };
+        wc.lpfnWndProc = LangWndProc;
+        wc.hInstance = hInstance;
+        wc.lpszClassName = L"LangClass";
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        RegisterClassW(&wc);
 
-void ShowDesktop()
-{
-    // 模拟 Win + D
+        HWND langWnd = CreateWindowExW(0, L"LangClass", L"选择语言", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            CW_USEDEFAULT, CW_USEDEFAULT, 380, 140, NULL, NULL, hInstance, sel);
+        if (langWnd)
+        {
+            RECT rc = { 0 };
+            GetWindowRect(langWnd, &rc);
+            int w = rc.right - rc.left;
+            int h = rc.bottom - rc.top;
+            int sx = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
+            int sy = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+            SetWindowPos(langWnd, NULL, sx, sy, 0, 0, SWP_NOZORDER | SWP_NOSIZE);
+
+            ShowWindow(langWnd, SW_SHOW);
+            UpdateWindow(langWnd);
+
+            MSG msg;
+            while (GetMessage(&msg, NULL, 0, 0))
+            {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+
+            chinese = (sel->choice == 1);
+        }
+        else
+        {
+            chinese = true;
+        }
+
+        UnregisterClassW(L"LangClass", hInstance);
+        delete sel;
+    }
+
     INPUT inputs[4] = {};
     inputs[0].type = INPUT_KEYBOARD;
     inputs[0].ki.wVk = VK_LWIN;
     inputs[1].type = INPUT_KEYBOARD;
     inputs[1].ki.wVk = 'D';
-    inputs[2] = inputs[1];
-    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
-    inputs[3] = inputs[0];
-    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[2] = inputs[1]; inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[3] = inputs[0]; inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(4, inputs, sizeof(INPUT));
-}
 
-std::wstring GetSpecialDesktopPath(bool allUsers)
-{
-    wchar_t path[MAX_PATH];
-    if (SUCCEEDED(SHGetFolderPathW(NULL,
-        allUsers ? CSIDL_COMMON_DESKTOPDIRECTORY : CSIDL_DESKTOPDIRECTORY,
-        NULL, 0, path)))
+    wstring desktop = GetDesktopPath();
+    if (!desktop.empty())
     {
-        return std::wstring(path);
-    }
-    return std::wstring();
-}
-
-std::wstring FindEdgeShortcutOnDesktops()
-{
-    std::vector<std::wstring> desktops;
-    desktops.push_back(GetSpecialDesktopPath(false));
-    desktops.push_back(GetSpecialDesktopPath(true));
-
-    for (auto& d : desktops)
-    {
-        if (d.empty()) continue;
-        WIN32_FIND_DATAW fd;
-        std::wstring pattern = d + L"\\*";
-        HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
-        if (h == INVALID_HANDLE_VALUE) continue;
-        do
-        {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            std::wstring name = fd.cFileName;
-            // 看文件名是否包含 "Microsoft Edge"（不区分大小写），并且通常为 .lnk
-            std::wstring lower = name;
-            for (auto& c : lower) c = towlower(c);
-            if (lower.find(L"microsoft edge") != std::wstring::npos)
-            {
-                std::wstring full = d + L"\\" + name;
-                FindClose(h);
-                return full;
-            }
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    }
-    return L"";
-}
-
-HWND FindEdgeWindow()
-{
-    struct EnumContext { HWND found; };
-    EnumContext ctx{ 0 };
-
-    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
-        EnumContext* ctx = (EnumContext*)lParam;
-        if (!IsWindowVisible(hwnd)) return TRUE;
-        DWORD pid = 0;
-        GetWindowThreadProcessId(hwnd, &pid);
-        if (pid == 0) return TRUE;
-
-        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-        if (!hProc) return TRUE;
-
-        wchar_t exePath[MAX_PATH] = {};
-        DWORD len = (DWORD)std::size(exePath);
-        if (QueryFullProcessImageNameW(hProc, 0, exePath, &len))
-        {
-            std::wstring s = exePath;
-            for (auto& c : s) c = towlower(c);
-            if (s.find(L"msedge.exe") != std::wstring::npos)
-            {
-                ctx->found = hwnd;
-                CloseHandle(hProc);
-                return FALSE; // stop enumeration
-            }
-        }
-        CloseHandle(hProc);
-        return TRUE;
-    }, (LPARAM)&ctx);
-
-    return ctx.found;
-}
-
-void SendCtrlLThenUrlAndEnter(HWND target, const std::wstring& url)
-{
-    if (!target) return;
-    // 尝试将目标置于前台
-    DWORD curThread = GetCurrentThreadId();
-    DWORD tgtThread = GetWindowThreadProcessId(target, NULL);
-    AttachThreadInput(curThread, tgtThread, TRUE);
-    SetForegroundWindow(target);
-    SetFocus(target);
-    AttachThreadInput(curThread, tgtThread, FALSE);
-
-    // 发送 Ctrl+L
-    INPUT in[4] = {};
-    in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_CONTROL;
-    in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = 'L';
-    in[2] = in[1]; in[2].ki.dwFlags = KEYEVENTF_KEYUP;
-    in[3] = in[0]; in[3].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(4, in, sizeof(INPUT));
-
-    // 发送 URL（使用 Unicode 输入）
-    std::vector<INPUT> inputs;
-    for (wchar_t ch : url)
-    {
-        INPUT iu{};
-        iu.type = INPUT_KEYBOARD;
-        iu.ki.wScan = ch;
-        iu.ki.dwFlags = KEYEVENTF_UNICODE;
-        inputs.push_back(iu);
-        INPUT iuUp = iu;
-        iuUp.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-        inputs.push_back(iuUp);
+        LaunchEdgeShortcutFound(desktop);
     }
 
-    // 回车
-    INPUT retDown{}; retDown.type = INPUT_KEYBOARD; retDown.ki.wVk = VK_RETURN;
-    INPUT retUp = retDown; retUp.ki.dwFlags = KEYEVENTF_KEYUP;
-    inputs.push_back(retDown);
-    inputs.push_back(retUp);
-
-    if (!inputs.empty())
-        SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
-}
-
-int wmain()
-{
-    // 1) 提升权限
-    if (!IsRunAsAdmin())
-    {
-        RelaunchElevatedAndExit();
-        return 0;
-    }
-
-    // 2) 语言选择
-    int choice = ShowLanguageSelectionDialog();
-    const wchar_t* url = (choice == 2) ? URL_EN : URL_CN;
-
-    // 3) 回到桌面
-    ShowDesktop();
-    Sleep(300); // give Windows a moment
-
-    // 4) 搜索桌面快捷方式名为 "Microsoft Edge"
-    std::wstring lnk = FindEdgeShortcutOnDesktops();
-    BOOL launched = FALSE;
-    if (!lnk.empty())
-    {
-        // 用 ShellExecute 打开 .lnk，相当于双击
-        HINSTANCE h = ShellExecuteW(NULL, L"open", lnk.c_str(), NULL, NULL, SW_SHOWNORMAL);
-        launched = (INT_PTR)h > 32;
-    }
-
-    if (!launched)
-    {
-        // 回退：使用协议直接打开 Edge（尽量模仿用户双击）
-        std::wstring proto = L"microsoft-edge:";
-        HINSTANCE h = ShellExecuteW(NULL, L"open", proto.c_str(), NULL, NULL, SW_SHOWNORMAL);
-        launched = (INT_PTR)h > 32;
-    }
-
-    // 5) 等待 2 秒
     Sleep(2000);
 
-    // 6) 找到 Edge 窗口并输入 URL
-    HWND edgeWnd = FindEdgeWindow();
-    if (edgeWnd)
+    DWORD edgePid = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE)
     {
-        SendCtrlLThenUrlAndEnter(edgeWnd, url);
-    }
-    else
-    {
-        // 备用：直接用协议一次性打开带 URL（当无法找到窗口时）
-        std::wstring full = std::wstring(L"microsoft-edge:") + url;
-        ShellExecuteW(NULL, L"open", full.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        PROCESSENTRY32W pe;
+        ZeroMemory(&pe, sizeof(pe));
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe))
+        {
+            do {
+                wstring exe = pe.szExeFile;
+                for (auto &c : exe) c = towlower(c);
+                if (exe == L"msedge.exe" || exe == L"microsoftedge.exe")
+                {
+                    edgePid = pe.th32ProcessID;
+                    break;
+                }
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
     }
 
+    HWND edgeHwnd = NULL;
+    if (edgePid != 0)
+    {
+        edgeHwnd = FindTopLevelWindowForProcess(edgePid);
+        if (edgeHwnd) SetForegroundWindow(edgeHwnd);
+    }
+
+    SendKey(VK_CONTROL, true);
+    SendKey('L', true);
+    SendKey('L', false);
+    SendKey(VK_CONTROL, false);
+    Sleep(100);
+
+    wstring url = chinese ? L"https://www.bilibili.com/video/BV1ad4y1V7wb" : L"https://www.bilibili.com/video/BV1AHmRBCEsq";
+    SendUnicodeString(url);
+    SendKey(VK_RETURN, true);
+    SendKey(VK_RETURN, false);
+
+    Sleep(800);
+
+    IUIAutomation *automation = NULL;
+    HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation));
+
+    if (automation && edgeHwnd)
+    {
+        const int maxAttempts = 6;
+        auto tryClick = [&](const wchar_t* name)->bool {
+            for (int i = 0; i < maxAttempts; i++) {
+                SetForegroundWindow(edgeHwnd);
+                Sleep(150 + i * 80);
+                if (FindAndClickByName(automation, edgeHwnd, name)) return true;
+            }
+            return false;
+        };
+
+        Sleep(2000);
+
+        bool ok = tryClick(L"从头播放");
+        Sleep(500);
+        bool ok2 = tryClick(L"点击恢复音量");
+
+        automation->Release();
+    }
+
+    if (edgeHwnd) SetForegroundWindow(edgeHwnd);
+    Sleep(50);
+    SendKey('F', true);
+    SendKey('F', false);
+
+    CoUninitialize();
     return 0;
+}
+
+int main()
+{
+    return wWinMain(GetModuleHandle(NULL), NULL, GetCommandLineW(), SW_SHOW);
 }

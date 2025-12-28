@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="GongXiFaCai/GongXiFaCai.vcxproj" />
+  <Project Path="GongXiFaCai/GongXiFaCai.vcxproj" Id="7dd0f4d3-9599-448e-8041-eef64370514c" />
 </Solution>
