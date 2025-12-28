@@ -112,22 +112,47 @@ wstring GetDesktopPath()
     return L"";
 }
 
-bool LaunchEdgeShortcutFound(const wstring &desktop)
+bool LaunchBrowserShortcutFound(const wstring &desktop)
 {
-    for (auto &entry : fs::directory_iterator(desktop))
+    struct BrowserInfo { vector<wstring> keywords; wstring exe; };
+    vector<BrowserInfo> browsers = {
+        { { L"microsoft edge", L"edge" }, L"msedge.exe" },
+        { { L"google chrome", L"chrome" }, L"chrome.exe" },
+        { { L"mozilla firefox", L"firefox" }, L"firefox.exe" }
+    };
+
+    if (!desktop.empty())
     {
-        if (!entry.is_regular_file()) continue;
-        wstring name = entry.path().filename().wstring();
-        // case-insensitive search for "Microsoft Edge"
-        wstring lower = name;
-        for (auto &c : lower) c = towlower(c);
-        if (lower.find(L"microsoft edge") != wstring::npos && entry.path().extension() == L".lnk")
+        for (auto &entry : fs::directory_iterator(desktop))
         {
-            // shell execute the .lnk will open edge
-            ShellExecuteW(NULL, L"open", entry.path().c_str(), NULL, NULL, SW_SHOWNORMAL);
-            return true;
+            if (!entry.is_regular_file()) continue;
+            wstring name = entry.path().filename().wstring();
+            wstring lower = name;
+            for (auto &c : lower) c = towlower(c);
+            if (entry.path().extension() == L".lnk")
+            {
+                for (auto &b : browsers)
+                {
+                    for (auto &kw : b.keywords)
+                    {
+                        if (lower.find(kw) != wstring::npos)
+                        {
+                            ShellExecuteW(NULL, L"open", entry.path().c_str(), NULL, NULL, SW_SHOWNORMAL);
+                            return true;
+                        }
+                    }
+                }
+            }
         }
     }
+
+    for (auto &b : browsers)
+    {
+        HINSTANCE h = ShellExecuteW(NULL, L"open", b.exe.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        if ((INT_PTR)h > 32)
+            return true;
+    }
+
     return false;
 }
 
@@ -159,7 +184,6 @@ bool ClickElement(IUIAutomationElement *elem)
             VariantClear(&var);
             int x = (int)(left + width / 2);
             int y = (int)(top + height / 2);
-            // simulate mouse click
             SetCursorPos(x, y);
             INPUT inputs[2] = {};
             inputs[0].type = INPUT_MOUSE;
@@ -306,7 +330,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
     wstring desktop = GetDesktopPath();
     if (!desktop.empty())
     {
-        LaunchEdgeShortcutFound(desktop);
+        LaunchBrowserShortcutFound(desktop);
     }
 
     Sleep(2000);
